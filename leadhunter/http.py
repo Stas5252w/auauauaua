@@ -50,4 +50,21 @@ class Fetcher:
         final = str(r.url)
         if "showcaptcha" in final or "captcha" in final.split("?")[0]:
             raise CaptchaError(f"капча на {url.split('?')[0]}")
+        if r.status_code in (200, 403, 503) and _is_challenge(r):
+            raise CaptchaError(f"антибот-проверка на {url.split('?')[0]}")
         return r
+
+
+# Маркеры страниц-заглушек DDoS-Guard / Cloudflare / Яндекса; настоящие страницы с ними маленькими не бывают
+_CHALLENGE_MARKERS = ("ddos-guard", "cf-chl", "checking your browser", "smartcaptcha", "showcaptcha")
+
+
+def _is_challenge(r) -> bool:
+    try:
+        body = r.text
+    except Exception:
+        return False
+    if not body or len(body) > 100_000:
+        return False
+    low = body.lower()
+    return any(m in low for m in _CHALLENGE_MARKERS)

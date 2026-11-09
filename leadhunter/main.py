@@ -3,6 +3,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import BotCommand
 
 from .bot.callbacks import build_callbacks
 from .bot.content import build_content_router
@@ -16,14 +17,29 @@ from .content.runtime import build_content, build_llm, reconfigure_ai
 from .content.scheduler import autopilot_loop, content_loop
 from .db import Database
 from .integrations import Integrations, load_overrides
-from .loops import digest_loop, followup_loop, sla_loop
+from .loops import digest_loop, followup_loop, purge_loop, sla_loop
 from .phrases import PhraseProvider, default_phrases
 from .pipeline import Pipeline
 from .sources import build_sources
+from .sources.base import watch
 from .sources.telegram_chats import TelegramChatsSource
 from .webhook import MultiNotifier, WebhookNotifier
 
 log = logging.getLogger("leadhunter")
+
+BOT_COMMANDS = [
+    ("start", "Начать работу"), ("setup", "Подключения и ключи"), ("status", "Состояние бота"),
+    ("niche", "Выбрать нишу"), ("app", "Открыть кабинет"), ("fresh", "Самые свежие лиды"),
+    ("leads", "Последние лиды"), ("stats", "Статистика"), ("digest", "Дайджест за день"),
+    ("funnel", "Воронка по лидам"), ("export", "Экспорт лидов в CSV"), ("sources", "Состояние источников"),
+    ("post", "Сгенерировать пост"), ("toon", "Сгенерировать мультик"), ("ideas", "Идеи для контента"),
+    ("queue", "Очередь публикаций"), ("autopilot", "Автопилот контента"), ("pause", "Поставить поиск на паузу"),
+    ("resume", "Возобновить поиск"), ("help", "Список команд"),
+]
+
+
+def spawn(coro, name: str) -> asyncio.Task:
+    return watch(asyncio.create_task(coro, name=name))
 
 
 async def run() -> None:
@@ -87,21 +103,29 @@ async def run() -> None:
     deps.extra["integrations"] = Integrations(db, s, on_change)
     deps.extra["settings"] = s
 
-    tasks = [asyncio.create_task(src.run(pipeline.handle), name=src.name) for src in sources]
-    tasks.append(asyncio.create_task(sla_loop(db, tg_notifier, s.sla_minutes, s.sla_min_score), name="sla"))
-    tasks.append(asyncio.create_task(followup_loop(db, tg_notifier), name="followup"))
-    tasks.append(asyncio.create_task(content_loop(factory, deps.extra["publishers"], deps.extra["content_notify"]), name="content"))
-    tasks.append(asyncio.create_task(autopilot_loop(factory, deps.extra["deliver_to_team"], s.digest_tz, s.content_hour), name="autopilot"))
+    try:
+        await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in BOT_COMMANDS])
+    except Exception as e:
+        log.warning("не удалось зарегистрировать команды бота: %s", e)
+
+    tasks = [spawn(src.run(pipeline.handle), src.name) for src in sources]
+    tasks.append(spawn(sla_loop(db, tg_notifier, s.sla_minutes, s.sla_min_score), "sla"))
+    tasks.append(spawn(followup_loop(db, tg_notifier), "followup"))
+    tasks.append(spawn(content_loop(factory, deps.extra["publishers"], deps.extra["content_notify"]), "content"))
+    tasks.append(spawn(autopilot_loop(factory, deps.extra["deliver_to_team"], s.digest_tz, s.content_hour), "autopilot"))
+    tasks.append(spawn(purge_loop(db, s.seen_ttl_days), "purge"))
     if s.digest_hour is not None:
-        tasks.append(asyncio.create_task(digest_loop(db, tg_notifier, s.digest_hour, s.digest_tz), name="digest"))
+        tasks.append(spawn(digest_loop(db, tg_notifier, s.digest_hour, s.digest_tz), "digest"))
     if s.miniapp_url:
         from .miniapp.server import start_miniapp
-        tasks.append(asyncio.create_task(start_miniapp(s, db, bot, deps), name="miniapp"))
+        tasks.append(spawn(start_miniapp(s, db, bot, deps), "miniapp"))
     try:
         await dp.start_polling(bot)
     finally:
         for t in tasks:
             t.cancel()
+        # Дожидаемся задач до закрытия базы, иначе они пишут в закрытое соединение
+        await asyncio.gather(*tasks, return_exceptions=True)
         if tunnel:
             await tunnel.stop()
         await db.close()
