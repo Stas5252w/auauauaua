@@ -6,10 +6,22 @@ import tempfile
 from .video import ffmpeg_available
 
 
-async def _run(*args: str) -> None:
+FFMPEG_TIMEOUT = 600.0  # с на один шаг: клипы Omni тяжелее кадров из Pillow
+
+
+async def _run(*args: str, timeout: float | None = None) -> None:
+    timeout = FFMPEG_TIMEOUT if timeout is None else timeout
     proc = await asyncio.create_subprocess_exec("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
                                                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-    _, err = await proc.communicate()
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout)
+    except BaseException as e:  # таймаут и отмена: не оставляем зависший процесс
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        if isinstance(e, asyncio.TimeoutError):
+            raise RuntimeError(f"ffmpeg не уложился в {timeout:g} с и был остановлен") from None
+        raise
     if proc.returncode != 0:
         raise RuntimeError("ffmpeg: " + err.decode(errors="ignore")[-400:])
 
@@ -18,7 +30,13 @@ async def _has_audio(path: str) -> bool:
     proc = await asyncio.create_subprocess_exec("ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
                                                 "stream=codec_type", "-of", "csv=p=0", path,
                                                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    out, _ = await proc.communicate()
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), 30)
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        raise
     return b"audio" in out
 
 

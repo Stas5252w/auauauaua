@@ -36,9 +36,13 @@ class WebSearchSource(Source):
 
         def search():
             try:
-                return DDGS().text(query, region="ru-ru", timelimit="w", max_results=20)
-            except Exception as e:  # ddgs кидает исключение на пустую выдачу
-                log.debug("ddgs %r: %s", query, e)
+                # «d», как и qdr:d у Serper: даты в выдаче нет, found_at=now допустимо только для суточного окна
+                return DDGS().text(query, region="ru-ru", timelimit="d", max_results=20)
+            except Exception as e:
+                if "no results" in str(e).lower():  # ddgs кидает исключение на пустую выдачу — это норма
+                    log.debug("ddgs %r: пусто", query)
+                else:
+                    log.warning("ddgs %r: %s: %s", query, type(e).__name__, e)
                 return []
 
         rows = await asyncio.to_thread(search)
@@ -50,12 +54,16 @@ class WebSearchSource(Source):
         for site in self.sites:
             for phrase in phrases:
                 query = f'site:{site} "{phrase}"'
-                rows = await (self._serper(query) if self.serper_key else self._ddg(query))
+                try:
+                    rows = await (self._serper(query) if self.serper_key else self._ddg(query))
+                except Exception as e:
+                    log.warning("web search %r: %s", query, e)
+                    rows = []
                 for r in rows:
                     if not r["url"] or site not in r["url"]:
                         continue
                     leads.append(Lead(source=f"web:{site}", external_id=r["url"], title=r["title"],
-                                      text=r["text"], url=r["url"]))
+                                      text=r["text"], url=r["url"], extra={"undated": True}))
                 if not self.serper_key:
                     await asyncio.sleep(3)  # DDG без ключа — не долбим
         return leads
