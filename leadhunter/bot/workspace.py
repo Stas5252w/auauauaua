@@ -2,10 +2,12 @@
 
 Бот должен быть админом с правом «Управление темами». Команда /setup_group внутри группы создаёт темы
 и запоминает их id; дальше каждый лид уходит в свою тему, горячие — со звуком."""
+import asyncio
 import logging
+import time
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 from ..db import Database
 from ..models import Lead
@@ -51,9 +53,12 @@ def message_link(chat_id: int, thread_id: int | None, msg_id: int) -> str:
 
 
 class Workspace:
+    PACE = 0.3  # сек между сообщениями в группу
+
     def __init__(self, bot: Bot, db: Database):
         self.bot = bot
         self.db = db
+        self._last_send = 0.0
 
     async def chat_id(self) -> int | None:
         raw = await self.db.get_setting(WORKSPACE_KEY)
@@ -95,11 +100,25 @@ class Workspace:
             return None
         thread_id = await self.topic(key)
         try:
-            return await self.bot.send_message(chat_id, text, message_thread_id=thread_id,
-                                               disable_notification=silent, disable_web_page_preview=True, **kwargs)
+            return await self._send_paced(chat_id, text, message_thread_id=thread_id,
+                                          disable_notification=silent, disable_web_page_preview=True, **kwargs)
         except TelegramBadRequest as e:
             if "thread not found" in e.message.lower() or "TOPIC_DELETED" in e.message:
                 await self.db.set_setting(f"topic:{key}", "")
-                return await self.bot.send_message(chat_id, text, disable_notification=silent,
-                                                   disable_web_page_preview=True, **kwargs)
+                return await self._send_paced(chat_id, text, disable_notification=silent,
+                                              disable_web_page_preview=True, **kwargs)
             raise
+
+    async def _send_paced(self, chat_id: int, text: str, **kwargs):
+        # Пауза между подряд идущими карточками + один повтор после 429, иначе лид уезжал бы в личку владельца
+        wait = self.PACE - (time.monotonic() - self._last_send)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            try:
+                return await self.bot.send_message(chat_id, text, **kwargs)
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(min(e.retry_after, 60))
+                return await self.bot.send_message(chat_id, text, **kwargs)
+        finally:
+            self._last_send = time.monotonic()

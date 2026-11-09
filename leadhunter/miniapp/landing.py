@@ -43,3 +43,8 @@ def render_thanks(row, brand) -> str:
     body = (f'<div class="bar"></div><h1>Спасибо!</h1><p class="sub">Заявка по «{e(row["title"] or row["topic"])}» получена — '
             f'напишем вам в ближайшее время.</p>')
     return _page("Спасибо", brand, body)
+
+
+def render_notice(title: str, text: str, brand) -> str:
+    e = html.escape
+    return _page(title, brand, f'<div class="bar"></div><h1>{e(title)}</h1><p class="sub">{e(text)}</p>')

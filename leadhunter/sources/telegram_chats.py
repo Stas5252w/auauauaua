@@ -1,14 +1,16 @@
 import asyncio
 import logging
+import random
 import re
 from datetime import datetime, timedelta, timezone
 
 from telethon import TelegramClient, events, functions
+from telethon.errors import FloodWaitError
 from telethon.tl.types import Channel, Chat, User
 
 from ..config import Settings
 from ..models import Lead
-from .base import Emit, Source
+from .base import Emit, Source, watch
 
 log = logging.getLogger(__name__)
 INVITE_RE = re.compile(r"(?:t\.me/\+|t\.me/joinchat/|^\+)([\w-]+)")
@@ -124,34 +126,53 @@ class TelegramChatsSource(Source):
 
     # --- основной цикл ---
     async def run(self, emit: Emit) -> None:
-        await self.client.start()
+        # client.start() без сессии просит код через input() — в Docker это EOFError/зависание
+        await self.client.connect()
+        if not await self.client.is_user_authorized():
+            self.last_error = "аккаунт не авторизован: python -m leadhunter.tg_login"
+            log.error("Telegram-аккаунт не авторизован: выполните python -m leadhunter.tg_login")
+            await self._alert("⚠️ telegram: аккаунт не авторизован, источник выключен. "
+                              "Выполните: python -m leadhunter.tg_login")
+            await self.client.disconnect()
+            return
         me = await self.client.get_me()
         self.me_id = me.id
         log.info("telegram: вошли как %s", me.username or me.id)
-        for target in self.join_chats:
-            try:
-                log.info("telegram: вступили в %s", await self.join(target))
-            except Exception as e:
-                log.warning("telegram: не удалось вступить в %s: %s", target, e)
+        for i, target in enumerate(self.join_chats):
+            if i:
+                await asyncio.sleep(random.uniform(5, 15))  # вступление пачкой = FloodWait/бан
+            for attempt in range(2):
+                try:
+                    log.info("telegram: вступили в %s", await self.join(target))
+                    break
+                except FloodWaitError as e:
+                    log.warning("telegram: FloodWait %s с, вступление в %s", e.seconds, target)
+                    await asyncio.sleep(min(e.seconds + 1, 600))
+                except Exception as e:
+                    log.warning("telegram: не удалось вступить в %s: %s", target, e)
+                    break
 
         chats = self.chats or None
 
         @self.client.on(events.NewMessage(chats=chats, incoming=True))
         async def on_message(event):
-            if not (event.is_group or event.is_channel) or not event.raw_text:
-                return
-            sender = await event.get_sender()
-            if isinstance(sender, User) and (sender.bot or sender.id == self.me_id):
-                return
-            chat = await event.get_chat()
-            if self.on_message_stats:
-                try:
-                    await self.on_message_stats(str(chat.id), getattr(chat, "title", "") or "", 1, 0)
-                except Exception:
-                    log.debug("chat stats failed", exc_info=True)
-            await emit(self._to_lead(event.message, chat, sender))
+            try:
+                if not (event.is_group or event.is_channel) or not event.raw_text:
+                    return
+                sender = await event.get_sender()
+                if isinstance(sender, User) and (sender.bot or sender.id == self.me_id):
+                    return
+                chat = await event.get_chat()
+                if self.on_message_stats:
+                    try:
+                        await self.on_message_stats(str(chat.id), getattr(chat, "title", "") or "", 1, 0)
+                    except Exception:
+                        log.debug("chat stats failed", exc_info=True)
+                await emit(self._to_lead(event.message, chat, sender))
+            except Exception:
+                log.exception("telegram: ошибка обработки сообщения")
 
-        asyncio.create_task(self._search_loop(emit))
+        watch(asyncio.create_task(self._search_loop(emit), name="telegram-search"))
         await self.client.run_until_disconnected()
 
     async def _search_loop(self, emit: Emit) -> None:

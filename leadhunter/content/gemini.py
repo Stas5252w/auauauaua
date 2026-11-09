@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import logging
+import re
 import struct
 
 import httpx
@@ -13,6 +14,8 @@ API = "https://generativelanguage.googleapis.com/v1beta"
 OPENAI_BASE = f"{API}/openai/"
 
 TTS_FALLBACK = "gemini-3.8-flash-lite-tts"  # тоже бесплатный, отдельная квота
+
+VIDEO_MIN_SECONDS, VIDEO_DEFAULT_SECONDS, VIDEO_MAX_SECONDS = 3, 8, 15  # Omni 1.2 Flash: клипы до 15 с
 
 DEFAULTS = {
     "image_model": "gemini-nano-banana-2.1",  # платный тариф; бюджетный вариант — gemini-3.1-flash-lite-image
@@ -141,7 +144,6 @@ class GeminiMedia:
                     continue
                 wait = 22.0
                 if "retry in" in msg.lower():
-                    import re
                     m = re.search(r"retry in (\d+)s", msg, re.I)
                     if m:
                         wait = min(90.0, float(m.group(1)) + 2)
@@ -171,7 +173,7 @@ class GeminiMedia:
                 pass
         return pcm_to_wav(raw, rate)
 
-    async def video(self, prompt: str, *, aspect: str = "9:16", duration: int = 8, image: bytes | None = None,
+    async def video(self, prompt: str, *, aspect: str = "9:16", duration: int = VIDEO_DEFAULT_SECONDS, image: bytes | None = None,
                     negative_prompt: str = "", poll_interval: float = 10.0, timeout: float = 600.0) -> bytes | None:
         if not self.video_enabled or not prompt.strip():
             return None
@@ -183,7 +185,7 @@ class GeminiMedia:
             parts.insert(0, {"type": "image", "data": base64.b64encode(image).decode(),
                              "mime_type": "image/png" if image[:4] == b"\x89PNG" else "image/jpeg"})
         fmt = {"type": "video", "aspect_ratio": aspect if aspect in ("9:16", "16:9") else "9:16",
-               "duration": f"{max(3, min(15, int(duration)))}s", "resolution": "720p"}
+               "duration": f"{max(VIDEO_MIN_SECONDS, min(VIDEO_MAX_SECONDS, int(duration)))}s", "resolution": "720p"}
         data = await self._interact(self.video_model, parts, fmt, timeout=timeout)
 
         waited = 0.0

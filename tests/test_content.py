@@ -1,4 +1,5 @@
 """Контент-фабрика сквозь бота: команды, кнопки, правки с обучением, публикация, планировщик, Mini App и лендинг."""
+import asyncio
 import json
 import os
 import time
@@ -309,7 +310,9 @@ async def test_scheduler_and_autopilot(env):
     assert await publish_due(env.factory, [pub, Broken()], notify) == 1
     assert pub.calls[0][1] == 1 and "#сайт" in pub.calls[0][0]
     row = await env.factory.store.get(1)
-    assert row["status"] == "published" and "опубликован" in notes[0] and "⚠️" not in notes[0]
+    # VK упал — это не теряется: частично, ошибка в карточке и в сообщении
+    assert row["status"] == "partial" and "частично" in notes[0] and "VK: токен протух" in notes[0]
+    assert json.loads(row["publish_errors"])[0]["platform"] == "vk" and "❌ VK" in format_card(row)
     # без площадок — возвращаем в черновики и предупреждаем
     await env.text("/post вторая")
     await env.factory.store.schedule(2, datetime.now(timezone.utc) - timedelta(minutes=1))
@@ -457,3 +460,135 @@ async def test_aivideo_assemble(tmp_path):
     out = str(tmp_path / "out.mp4")
     await assemble([(clip.read_bytes(), voice.read_bytes()), (mute.read_bytes(), None)], out, size=(360, 640))
     assert os.path.getsize(out) > 0 and abs(await probe_duration(out) - 4.0) < 0.6
+
+
+# --- идемпотентность публикации ---
+class FakePub:
+    def __init__(self, platform="telegram", label=None, fail=None, delay=0.0):
+        self.platform, self.label = platform, label or platform.upper()
+        self.fail, self.delay, self.calls = fail, delay, 0
+
+    async def publish(self, text, images=(), video_path=None):
+        self.calls += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.fail:
+            raise RuntimeError(self.fail)
+        return PublishResult(self.platform, f"https://x/{self.platform}")
+
+
+async def test_duplicate_publish_is_noop(env):
+    await env.text("/post тема")
+    row = await env.factory.store.get(1)
+    pub = FakePub(delay=0.2)
+    a, b = await asyncio.gather(env.factory.publish(row, [pub]), env.factory.publish(row, [pub]))
+    assert pub.calls == 1
+    busy = next(o for o in (a, b) if o.status == "busy")
+    assert "уже публикуется" in busy.errors[0]
+    assert (await env.factory.store.get(1))["status"] == "published"
+    again = await env.factory.publish(row, [pub])  # устаревшая строка тоже не пройдёт
+    assert pub.calls == 1 and again.status == "busy" and "уже опубликовано" in again.errors[0]
+
+
+async def test_restart_mid_publish_retries_only_missing(env):
+    await env.text("/post тема")
+    store = env.factory.store
+    tg, vk = FakePub("telegram"), FakePub("vk")
+    # процесс упал в publishing: telegram уже записан, vk нет
+    await store.update(1, status="publishing", published=[{"platform": "telegram", "url": "https://x/telegram"}],
+                       publishing_at=(datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(), publish_attempts=1)
+    notes = []
+
+    async def notify(t):
+        notes.append(t)
+
+    assert await publish_due(env.factory, [tg, vk], notify) == 1
+    assert tg.calls == 0 and vk.calls == 1 and "прервалась" in notes[0]
+    row = await store.get(1)
+    assert row["status"] == "published" and {p["platform"] for p in json.loads(row["published"])} == {"telegram", "vk"}
+
+
+async def test_fresh_publishing_not_requeued(env):
+    await env.text("/post тема")
+    store = env.factory.store
+    await store.update(1, status="publishing", publishing_at=datetime.now(timezone.utc).isoformat(), publish_attempts=1)
+    assert await store.requeue_stuck(10) == [] and (await store.get(1))["status"] == "publishing"
+    await store.update(1, publishing_at=(datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(), publish_attempts=3)
+    assert await store.requeue_stuck(10, exclude={1}) == []  # публикует этот же процесс
+    assert await store.requeue_stuck(10) == [(1, False)]  # попытки исчерпаны: автоповтора нет
+    assert (await store.get(1))["status"] == "draft"
+
+
+async def test_partial_failure_and_retry_only_failed(env):
+    await env.text("/post тема")
+    tg, vk = FakePub("telegram"), FakePub("vk", "VK", fail="токен протух")
+    out = await env.factory.publish(await env.factory.store.get(1), [tg, vk])
+    row = await env.factory.store.get(1)
+    assert out.status == "partial" and row["status"] == "partial" and out.errors == ["VK: токен протух"]
+    assert [p["platform"] for p in json.loads(row["published"])] == ["telegram"]
+    assert "частично" in (await env.factory.store.get(1))["status"] or "VK" in format_card(row)
+    vk.fail = None
+    out = await env.factory.publish(row, [tg, vk])
+    row = await env.factory.store.get(1)
+    assert tg.calls == 1 and vk.calls == 2 and out.status == "published" and row["status"] == "published"
+    assert row["publish_errors"] is None and len(json.loads(row["published"])) == 2
+
+
+async def test_all_failed_returns_to_draft(env):
+    await env.text("/post тема")
+    out = await env.factory.publish(await env.factory.store.get(1), [FakePub(fail="нет")])
+    row = await env.factory.store.get(1)
+    assert out.status == "draft" and row["status"] == "draft" and not json.loads(row["published"] or "[]")
+
+
+async def test_cancelled_platform_not_marked_done(env):
+    await env.text("/post тема")
+    tg, slow = FakePub("telegram"), FakePub("vk", delay=30)
+    task = asyncio.create_task(env.factory.publish(await env.factory.store.get(1), [tg, slow]))
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    row = await env.factory.store.get(1)
+    assert row["status"] == "partial" and [p["platform"] for p in json.loads(row["published"])] == ["telegram"]
+    assert env.factory.active == set()
+
+
+async def test_platform_timeout_is_error(env, monkeypatch):
+    from leadhunter.content import factory as fmod
+    monkeypatch.setattr(fmod, "PLATFORM_TIMEOUT", 0.05)
+    await env.text("/post тема")
+    out = await env.factory.publish(await env.factory.store.get(1), [FakePub(delay=5)])
+    row = await env.factory.store.get(1)
+    assert out.status == "draft" and "таймаут" in out.errors[0] and row["status"] == "draft"
+
+
+async def test_failed_render_leaves_no_orphan_file(env, monkeypatch):
+    from leadhunter.content import video as vmod
+
+    async def boom(scenes, brand, out_path, **kw):
+        with open(out_path, "wb") as f:
+            f.write(b"partial")
+        raise RuntimeError("ffmpeg упал")
+
+    monkeypatch.setattr(vmod, "build_video", boom)
+    before = set(os.listdir(env.factory.media.root))
+    with pytest.raises(RuntimeError):
+        await env.factory._video({"scenes": [{"text": "a", "voice": "", "duration": 1}]}, await env.factory.brand())
+    assert set(os.listdir(env.factory.media.root)) == before
+
+
+async def test_ffmpeg_timeout_kills_process(monkeypatch):
+    from leadhunter.content import aivideo, video
+
+    with pytest.raises(RuntimeError, match="не уложился"):
+        await video._run("sleep", "5", timeout=0.2)
+
+    real = asyncio.create_subprocess_exec
+
+    async def fake_exec(*args, **kw):  # вместо ffmpeg — долгий sleep
+        return await real("sleep", "5", **kw)
+
+    monkeypatch.setattr(aivideo.asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(RuntimeError, match="не уложился"):
+        await aivideo._run("-i", "x", timeout=0.2)
