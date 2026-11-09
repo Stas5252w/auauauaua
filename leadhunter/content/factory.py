@@ -15,12 +15,14 @@ log = logging.getLogger(__name__)
 # Куда реально умеем публиковать через API; остальное (TikTok, Дзен…) — пакетом для ручной выкладки
 API_PLATFORMS = {"telegram": "Telegram", "vk": "VK", "threads": "Threads", "instagram": "Instagram", "youtube": "YouTube"}
 MANUAL_PLATFORMS = {"tiktok": "TikTok", "dzen": "Дзен", "pinterest": "Pinterest"}
+PLATFORM_TIMEOUT = 300  # с на одну площадку
 
 
 @dataclass
 class Outcome:
     results: list  # PublishResult
     errors: list[str]
+    status: str = ""  # busy — уже идёт/вышло; published | partial | draft — итог этого прохода
 
 
 def brand_from_setting(raw: str | None):
@@ -52,6 +54,7 @@ class ContentFactory:
         self.ai = ai  # картинки и озвучка: Gemini или OpenAI (общий интерфейс image/speech/*_enabled)
         self.video_ai = video_ai  # ИИ-видео через Gemini Omni
         self.db = db
+        self.active: set[int] = set()  # материалы, которые этот процесс публикует прямо сейчас
 
     async def brand(self):
         return brand_from_setting(await self.db.get_setting("brand"))
@@ -143,6 +146,14 @@ class ContentFactory:
             log.warning("озвучка не удалась: %s", e)
             return None
 
+    async def _built(self, name: str, build) -> None:
+        """Ждёт сборку ролика; при сбое/отмене убирает недописанный файл."""
+        try:
+            await build
+        except BaseException:
+            self.media.discard(name)
+            raise
+
     async def _video(self, data: dict, brand) -> str:
         from .video import build_video
 
@@ -152,8 +163,8 @@ class ContentFactory:
                            "audio": await self._speech(s.get("voice", ""))})
         if not scenes:
             raise RuntimeError("в сценарии нет сцен")
-        name = self.media.save(b"", ".mp4")
-        await build_video(scenes, brand, self.media.path(name))
+        name = self.media.reserve(".mp4")
+        await self._built(name, build_video(scenes, brand, self.media.path(name)))
         return name
 
     async def _toon(self, data: dict, brand) -> str:
@@ -163,8 +174,8 @@ class ContentFactory:
         for scene in script["scenes"]:
             line = scene.get("line") or {}
             scene["audio"] = await self._speech(line.get("text", ""))
-        name = self.media.save(b"", ".mp4")
-        await build_toon(script, brand, self.media.path(name))
+        name = self.media.reserve(".mp4")
+        await self._built(name, build_toon(script, brand, self.media.path(name)))
         return name
 
     async def _aivideo(self, data: dict) -> str:
@@ -180,8 +191,8 @@ class ContentFactory:
             clips.append((video, await self._speech(clip.get("voice", ""))))
         if not clips:
             raise RuntimeError("нет клипов")
-        name = self.media.save(b"", ".mp4")
-        await assemble(clips, self.media.path(name))
+        name = self.media.reserve(".mp4")
+        await self._built(name, assemble(clips, self.media.path(name)))
         return name
 
     def files(self, row) -> tuple[list[bytes], str | None]:
@@ -198,22 +209,61 @@ class ContentFactory:
 
     # --- публикация ---
     async def publish(self, row, publishers: list, platforms: list[str] | None = None) -> Outcome:
-        text = compose_text(row)
-        images, video = self.files(row)
+        """Идемпотентно: материал захватывается атомарно (publishing), результат каждой площадки пишется сразу,
+        повтор (в т.ч. после рестарта) публикует только туда, где ещё не вышло."""
+        item_id = row["id"]
+        if not await self.store.claim_publish(item_id):
+            cur = await self.store.get(item_id)
+            st = cur["status"] if cur else ""
+            msg = {"publishing": "уже публикуется", "published": "уже опубликовано"}.get(
+                st, f"публикация недоступна (статус: {st or 'материала нет'})")
+            return Outcome([], [msg], status="busy")
+        self.active.add(item_id)
+        try:
+            return await self._publish_claimed(item_id, publishers, platforms)
+        finally:
+            self.active.discard(item_id)
+
+    async def _publish_claimed(self, item_id: int, publishers: list, platforms: list[str] | None) -> Outcome:
+        row = await self.store.get(item_id)  # свежая строка: вызывающий мог держать устаревшую
+        done = json.loads(row["published"] or "[]")
+        old_errors = {e["platform"]: e for e in json.loads(row["publish_errors"] or "[]") if e.get("platform")}
         wanted = platforms or [p.strip() for p in (row["platforms"] or "").split(",") if p.strip()] or None
+        targets = [p for p in publishers if not wanted or p.platform in wanted]
+        have = {d["platform"] for d in done}
         results, errors = [], []
-        for pub in publishers:
-            if wanted and pub.platform not in wanted:
-                continue
-            try:
-                results.append(await asyncio.wait_for(pub.publish(text, images, video), timeout=300))
-            except Exception as e:
-                errors.append(f"{pub.label}: {str(e)[:200]}")
-                log.warning("публикация %s в %s не удалась: %s", row["id"], pub.label, e)
-        if results:
-            published = json.loads(row["published"] or "[]") + [{"platform": r.platform, "url": r.url} for r in results]
-            await self.store.mark_published(row["id"], published)
-        return Outcome(results, errors)
+        status = "draft"
+        try:
+            text = compose_text(row)
+            images, video = self.files(row)
+            for pub in targets:
+                if pub.platform in have:
+                    continue
+                try:
+                    res = await asyncio.wait_for(pub.publish(text, images, video), timeout=PLATFORM_TIMEOUT)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    reason = str(e)[:200] or type(e).__name__
+                    if isinstance(e, asyncio.TimeoutError):
+                        reason = f"таймаут {PLATFORM_TIMEOUT} с, пост мог выйти — проверьте площадку"
+                    errors.append({"platform": pub.platform, "label": pub.label, "error": reason})
+                    log.warning("публикация %s в %s не удалась: %s", item_id, pub.label, e)
+                    continue
+                results.append(res)
+                have.add(pub.platform)
+                done.append({"platform": res.platform, "url": res.url})
+                await self.store.touch_publishing(item_id, done)
+        finally:
+            # и при отмене/сбое не оставляем материал в publishing; отменённая площадка в done не попадает
+            retried = {e["platform"] for e in errors}
+            kept = [e for p, e in old_errors.items() if p not in have and p not in retried]
+            all_done = bool(targets) and all(p.platform in have for p in targets)
+            status = await asyncio.shield(self.store.finish_publish(
+                item_id, done, [] if all_done else kept + errors, all_done=all_done))
+        if not targets:
+            return Outcome([], ["нет подходящих площадок"], status=status)
+        return Outcome(results, [f"{e['label'] or e['platform']}: {e['error']}" for e in errors], status=status)
 
     def magnet_text(self, row) -> str:
         return magnet_text(body_json(row)) if row["kind"] == "magnet" else (row["body"] or "")
