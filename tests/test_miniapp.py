@@ -135,3 +135,91 @@ async def test_settings_full_surface(client):
     assert s["brand"]["name"] == "Пиксель" and s["voice"] == "на ты" and s["autopilot"] is True and s["pillars"] == "а; б"
     assert (await client.post("/api/settings", headers=headers(), json={"brand": {"primary": "red"}})).status == 400
     assert (await client.post("/api/settings", headers=headers(), json={"niche": "nope"})).status == 400
+
+
+# --- лендинг: лимиты и защита от спама ---
+
+@pytest.fixture
+async def landing(tmp_path):
+    from leadhunter.content.render import Brand
+    from leadhunter.content.store import ContentStore
+
+    db = Database(str(tmp_path / "lp.db"))
+    await db.connect()
+    store = ContentStore(db)
+    await store.init()
+    slug_ids = {}
+    for kind_slug in ("a", "b"):
+        item_id = await store.add("magnet", kind_slug, title=f"Чек-лист {kind_slug}", body="{}")
+        slug_ids[kind_slug] = item_id
+
+    class Factory:
+        media = type("M", (), {"root": str(tmp_path)})()
+
+        async def brand(self):
+            return Brand()
+
+    Factory.store = store
+    guard = Guard(None, db, [OWNER])
+    deps = BotDeps(db, [], guard, PhraseProvider(db, ["нужен сайт"]), Workspace(None, db), None, "профиль")
+    deps.extra["factory"] = Factory()
+    api = MiniAppAPI(db, TOKEN, guard, deps, [])
+    slugs = {k: (await store.get(i))["slug"] for k, i in slug_ids.items()}
+    async with TestClient(TestServer(build_app(api))) as c:
+        c.slugs, c.store, c.api = slugs, store, api
+        yield c
+    await db.close()
+
+
+def form(**kw):
+    return {"name": "Оля", "contact": "@olya", **kw}
+
+
+async def test_landing_ip_limit_5_per_10_min_via_forwarded_for(landing):
+    slug = landing.slugs["a"]
+    for _ in range(5):
+        assert (await landing.post(f"/lp/{slug}", data=form(), headers={"X-Forwarded-For": "1.2.3.4, 10.0.0.1"})).status == 200
+    r = await landing.post(f"/lp/{slug}", data=form(), headers={"X-Forwarded-For": "1.2.3.4"})
+    assert r.status == 429 and "Слишком много" in await r.text()
+    r = await landing.post(f"/lp/{slug}", data=form(), headers={"X-Forwarded-For": "1.2.3.4", "Accept": "application/json"})
+    assert r.status == 429 and "error" in await r.json()
+    # другой IP не задет
+    assert (await landing.post(f"/lp/{slug}", data=form(), headers={"X-Forwarded-For": "5.6.7.8"})).status == 200
+
+
+def test_submit_limiter_windows_and_slug_cap():
+    from leadhunter.miniapp.server import SubmitLimiter
+
+    lim = SubmitLimiter()
+    assert all(lim.allow("ip", "s", now=t) for t in range(5))
+    assert not lim.allow("ip", "s", now=6)
+    assert lim.allow("ip", "s", now=601 + 4)  # окно 10 минут прошло
+    lim = SubmitLimiter()
+    assert all(lim.allow(f"ip{i}", "s", now=i) for i in range(30))
+    assert not lim.allow("new-ip", "s", now=31)  # 30 в час на страницу
+    assert lim.allow("new-ip", "other-slug", now=31)
+    assert lim.allow("new-ip", "s", now=3601 + 30)
+
+
+async def test_landing_rejected_status_blocks_post_and_get(landing):
+    slug = landing.slugs["b"]
+    item = await landing.store.by_slug(slug)
+    await landing.store.update(item["id"], status="rejected")
+    assert (await landing.get(f"/lp/{slug}")).status == 404
+    assert (await landing.post(f"/lp/{slug}", data=form())).status == 404
+
+
+async def test_landing_caps_lengths_and_keeps_honeypot(landing):
+    slug = landing.slugs["a"]
+    r = await landing.post(f"/lp/{slug}", data=form(name="н" * 500, contact="@" + "k" * 500, message="м" * 5000))
+    assert r.status == 200
+    cur = await landing.store.conn.execute("SELECT name, contact, message FROM landing_leads")
+    row = await cur.fetchone()
+    assert (len(row["name"]), len(row["contact"]), len(row["message"])) == (200, 200, 2000)
+    assert (await landing.post(f"/lp/{slug}", data=form(website="spam"))).status == 400
+
+
+async def test_init_data_only_from_header_not_query(client):
+    h = headers()["X-Init-Data"]
+    assert (await client.get("/api/me", params={"initData": h})).status == 401
+    assert (await client.get("/api/me", headers=headers())).status == 200

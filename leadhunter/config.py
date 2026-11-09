@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     hot_score: int = 8  # с этого балла лид идёт в «🔥 Горячие» со звуком
     deliver_dm: bool = False  # дублировать лидов владельцам в личку, даже если настроена группа
     sla_minutes: int = 10  # лид не взят столько минут → пинг в «Горячие»
+    seen_ttl_days: int = 30  # дедуп-таблицы (seen, хэши, события авторов) старше N дней чистятся
     sla_min_score: int = 7  # SLA считаем только для лидов с таким баллом и выше
     followup_hours: int = 24  # напомнить, если после «Написал» нет ответа
     spam_chats_per_hour: int = 3  # автор засветился в стольких чатах за час → рассылка, игнорируем
@@ -115,8 +116,9 @@ class Settings(BaseSettings):
     rss_feeds: StrList = Field(default_factory=lambda: ["https://www.fl.ru/rss/all.xml"])
     rss_interval: int = 300
 
-    # hh.ru — проектные вакансии (API публичный, нужен User-Agent с контактом)
-    hh_enabled: bool = True
+    # hh.ru — проектные вакансии. Публичный API с 2026 отдаёт 403 неавторизованным клиентам,
+    # поэтому по умолчанию выключен (код источника оставлен)
+    hh_enabled: bool = False
     hh_user_agent: str = "LeadHunter/0.1 (contact@example.com)"
     hh_queries: StrList = Field(
         default_factory=lambda: ["разработка сайта", "telegram бот", "автоматизация нейросеть", "ИИ анимация"]
