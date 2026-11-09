@@ -92,7 +92,8 @@ setup_env() {
 
     if command -v curl >/dev/null 2>&1 && [ -z "${LEADHUNTER_SKIP_NET:-}" ]; then
         local name=""
-        name="$(curl -fsS --max-time 10 "https://api.telegram.org/bot${token}/getMe" 2>/dev/null | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')" || true
+        # URL с токеном идёт через stdin (--config -), чтобы он не светился в `ps`
+        name="$(printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$token" | curl -fsS --max-time 10 --config - 2>/dev/null | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')" || true
         if [ -n "$name" ]; then ok "Токен принят: @$name"; else warn "Не смог проверить токен (нет сети или токен неверный) — продолжаю."; fi
     fi
 
@@ -104,6 +105,24 @@ setup_env() {
         tty_read 1 "Ключ Gemini: "; gem="${REPLY// /}"
     fi
     if [ -n "$gem" ]; then set_env GEMINI_API_KEY "$gem"; fi
+
+    local owner="${OWNER_IDS:-}"
+    if [ -z "$owner" ]; then owner="$(get_env OWNER_IDS)"; fi
+    if [ -z "$owner" ]; then
+        echo
+        echo "Ваш числовой Telegram ID — напишите @userinfobot, он ответит числом. Это защита: только вы сможете управлять ботом."
+        echo "Несколько владельцев — через запятую. Можно пропустить (Enter)."
+        tty_read 0 "Ваш Telegram ID: "; owner="${REPLY// /}"
+    fi
+    if [ -n "$owner" ] && ! printf '%s' "$owner" | grep -qE '^[0-9]+(,[0-9]+)*$'; then
+        warn "ID должен состоять из цифр (через запятую) — пропускаю."; owner=""
+    fi
+    if [ -n "$owner" ]; then
+        set_env OWNER_IDS "$owner"
+    else
+        warn "OWNER_IDS не задан. Бот сгенерирует одноразовый код привязки и напишет его в логи сервера —"
+        warn "его нужно будет отправить боту: /start КОД (docker compose logs / journalctl)."
+    fi
 
     set_env MINIAPP_TUNNEL "cloudflare"
     ok ".env готов (права 600, ключи не показываются)"
@@ -260,6 +279,9 @@ else
 fi
 
 say "Готово: напишите боту /start"
+if [ -z "$(get_env OWNER_IDS)" ]; then
+    echo "  Владелец не задан: возьмите код из логов бота («Владелец не задан…») и отправьте боту: /start КОД"
+fi
 echo "  Дальше в боте: выберите нишу кнопкой → /setup (ключ ИИ) → кнопка «Кабинет»."
 if [ -n "$RUN_CMD" ]; then
     echo

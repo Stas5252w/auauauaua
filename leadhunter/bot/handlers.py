@@ -99,11 +99,14 @@ def build_router(deps: BotDeps) -> Router:
         return await guard.allowed(m.from_user, m.chat.id)
 
     @router.message(Command("start"))
-    async def start(m: Message):
+    async def start(m: Message, command: CommandObject):
         first_owner = False
-        if not deps.guard.static_owners and not await db.get_setting("owner_ids"):
-            # Первый, кто написал боту, становится владельцем — дальше чужих игнорируем
-            await db.set_setting("owner_ids", str(m.from_user.id))
+        if not await guard.has_owner():
+            # Владельцем становится только тот, кто прислал одноразовый код из логов сервера
+            await guard.ensure_claim_code()
+            if m.chat.type != "private" or not await guard.claim_owner(m.from_user.id, command.args or ""):
+                await m.answer("Бот ещё не привязан к владельцу. Код — в логах сервера (docker compose logs / journalctl).")
+                return
             first_owner = True
         if not await allowed(m):
             return
@@ -267,7 +270,8 @@ def build_router(deps: BotDeps) -> Router:
 
     @router.message(Command("export"))
     async def export(m: Message):
-        if not await allowed(m):
+        # Выгрузка всех контактов — только владельцу, не участникам группы
+        if not await guard.is_owner(m.from_user.id):
             return
         data = await db.export_csv()
         await m.answer_document(BufferedInputFile(data, filename="leads.csv"), caption="Последние 1000 лидов")
@@ -562,6 +566,10 @@ def build_router(deps: BotDeps) -> Router:
         await m.answer("Чаты по нише (балл = насколько часто там ищут исполнителей):\n" + "\n".join(lines)
                        + "\n\nВступить: /tg_join @username")
 
+    async def announce_claim_code() -> None:
+        await guard.ensure_claim_code(announce=True)  # пишет код в лог, если владельца нет
+
+    router.startup.register(announce_claim_code)
     return router
 
 

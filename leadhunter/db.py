@@ -62,6 +62,13 @@ def content_hash(text: str) -> str:
     return hashlib.sha1(core.encode()).hexdigest()
 
 
+def _csv_safe(v):
+    # Ячейка с = + - @ в Excel исполняется как формула — экранируем апострофом
+    if isinstance(v, str) and v and v[0] in "=+-@\t\r":
+        return "'" + v
+    return v
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -81,29 +88,54 @@ class Database:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self._conn = await aiosqlite.connect(self.path)
         self._conn.row_factory = aiosqlite.Row
+        # WAL — читатели (кабинет, бот) не блокируют запись; busy_timeout — ждём, а не падаем с "database is locked"
+        await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA busy_timeout=5000")
+        await self._conn.execute("PRAGMA synchronous=NORMAL")
         await self._conn.executescript(SCHEMA)
         await self._migrate()
         await self._seed_keywords()
 
     async def _migrate(self) -> None:
+        """Версия схемы в PRAGMA user_version. Новый шаг — новая функция в конце списка."""
+        steps = [self._migrate_v1, self._migrate_v2]
+        cur = await self.conn.execute("PRAGMA user_version")
+        version = (await cur.fetchone())[0]
+        for i in range(version, len(steps)):
+            await steps[i]()
+            await self.conn.execute(f"PRAGMA user_version = {i + 1}")
+        await self.conn.commit()
+
+    async def _migrate_v1(self) -> None:
+        # Базовая схема: недостающие колонки leads для баз старых версий
         cur = await self.conn.execute("PRAGMA table_info(leads)")
         existing = {r[1] for r in await cur.fetchall()}
         for col, typ in LEAD_COLUMNS.items():
             if col not in existing:
                 await self.conn.execute(f"ALTER TABLE leads ADD COLUMN {col} {typ}")
-        await self.conn.commit()
+
+    async def _migrate_v2(self) -> None:
+        # Словарь переработан: в старых базах досеваем новые слова и убираем негативы,
+        # штрафовавшие заказчиков («сайт для онлайн-курса»). Пользовательские слова не трогаем.
+        for word in ("курс", "обучени", "вебинар"):
+            await self.conn.execute("DELETE FROM keywords WHERE kind = 'negative' AND word = ?", (word,))
+        await self.conn.executemany("INSERT OR IGNORE INTO keywords VALUES (?, ?, ?)", self._default_keyword_rows())
 
     async def close(self) -> None:
         if self._conn:
             await self._conn.close()
 
+    @staticmethod
+    def _default_keyword_rows() -> list[tuple[str, str, str | None]]:
+        rows: list[tuple[str, str, str | None]] = [("topic", w, cat) for w, cat in DEFAULT_TOPIC.items()]
+        rows += [("intent", w, None) for w in DEFAULT_INTENT] + [("negative", w, None) for w in DEFAULT_NEGATIVE]
+        return rows
+
     async def _seed_keywords(self) -> None:
         cur = await self.conn.execute("SELECT COUNT(*) FROM keywords")
         if (await cur.fetchone())[0]:
             return
-        rows = [("topic", w, cat) for w, cat in DEFAULT_TOPIC.items()]
-        rows += [("intent", w, None) for w in DEFAULT_INTENT] + [("negative", w, None) for w in DEFAULT_NEGATIVE]
-        await self.conn.executemany("INSERT OR IGNORE INTO keywords VALUES (?, ?, ?)", rows)
+        await self.conn.executemany("INSERT OR IGNORE INTO keywords VALUES (?, ?, ?)", self._default_keyword_rows())
         await self.conn.commit()
 
     # --- дедуп ---
@@ -121,6 +153,16 @@ class Database:
         )
         await self.conn.commit()
         return cur.rowcount == 1
+
+    async def purge_old(self, days: int) -> int:
+        """Чистит дедуп-таблицы старше days дней: иначе они растут вечно, а такой же запрос через полгода терялся."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        total = 0
+        for table, col in (("seen", "seen_at"), ("seen_hashes", "seen_at"), ("author_events", "at")):
+            cur = await self.conn.execute(f"DELETE FROM {table} WHERE {col} < ?", (cutoff,))
+            total += cur.rowcount
+        await self.conn.commit()
+        return total
 
     # --- лиды ---
     async def save_lead(self, lead: Lead, score: int, res: ScoreResult, *, summary: str | None = None,
@@ -357,7 +399,7 @@ class Database:
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow([d[0] for d in cur.description])
-        w.writerows(tuple(r) for r in rows)
+        w.writerows(tuple(_csv_safe(v) for v in r) for r in rows)
         return buf.getvalue().encode("utf-8-sig")  # BOM — чтобы Excel открыл кириллицу
 
     # --- ключевые слова ---

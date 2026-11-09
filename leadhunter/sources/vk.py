@@ -1,3 +1,4 @@
+import logging
 import time
 from datetime import datetime, timezone
 
@@ -8,6 +9,7 @@ from ..models import Lead
 from ..phrases import PhraseProvider
 from .base import Source
 
+log = logging.getLogger(__name__)
 API = "https://api.vk.com/method/newsfeed.search"
 
 
@@ -41,15 +43,23 @@ class VKSource(Source):
 
     async def poll(self) -> list[Lead]:
         leads: list[Lead] = []
+        error: Exception | None = None
         now = int(time.time())
         async with httpx.AsyncClient(timeout=30) as c:
             for q in await self.phrases.get():
-                r = await c.get(API, params={"q": q, "count": 200, "start_time": self.since,
-                                             "access_token": self.token, "v": "5.199"})
-                r.raise_for_status()
-                data = r.json()
-                if "error" in data:
-                    raise RuntimeError(f"VK API: {data['error'].get('error_msg')}")
-                leads += parse_posts(data)
-        self.since = now - 300  # небольшой нахлёст, дедуп отсеет повторы
+                try:
+                    r = await c.get(API, params={"q": q, "count": 200, "start_time": self.since,
+                                                 "access_token": self.token, "v": "5.199"})
+                    r.raise_for_status()
+                    data = r.json()
+                    if "error" in data:
+                        raise RuntimeError(f"VK API: {data['error'].get('error_msg')}")
+                    leads += parse_posts(data)
+                except Exception as e:
+                    log.warning("vk %r: %s", q, e)
+                    error = e
+        if error and not leads:
+            raise error
+        if not error:  # при сбое окно не двигаем — упавший запрос повторится со старым since
+            self.since = now - 300  # небольшой нахлёст, дедуп отсеет повторы
         return leads
