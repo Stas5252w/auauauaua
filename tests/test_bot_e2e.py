@@ -98,6 +98,11 @@ class Env:
         await self.dp.feed_update(self.bot, self._update(message=msg))
         return self.session.sent_texts()
 
+    async def claim(self, user_id: int = OWNER) -> list[str]:
+        """Привязка владельца по одноразовому коду (как его берут из логов)."""
+        code = await self.bot_guard.ensure_claim_code()
+        return await self.cmd(f"/start {code}", user_id=user_id)
+
     async def tap(self, data: str, user_id: int = OWNER, chat_id: int | None = None, msg_text: str = "карточка") -> list[tuple[str, dict]]:
         chat_id = chat_id or user_id
         self.session.reset()
@@ -123,7 +128,9 @@ async def env(tmp_path):
     dp = Dispatcher()
     dp.include_router(build_router(deps))
     dp.include_router(build_callbacks(deps))
-    yield Env(bot, dp, session, db, notifier, pipeline)
+    e = Env(bot, dp, session, db, notifier, pipeline)
+    e.bot_guard = guard
+    yield e
     await db.close()
     await session.close()
 
@@ -139,18 +146,19 @@ async def seed(env, n=3):
 async def test_start_makes_owner_and_redelivers_backlog(env):
     await seed(env)  # владельца ещё нет — лиды легли в базу без доставки
     assert len(await env.db.undelivered_leads()) == 3
-    texts = await env.cmd("/start")
+    texts = await env.claim()
     assert "ищу вам клиентов" in texts[0] and "нашёл 3 лидов" in texts[1]
     assert sum("Открыть источник" in t or "#" in t for t in texts[2:]) == 3
     assert await env.db.get_setting("owner_ids") == str(OWNER)
     assert await env.db.undelivered_leads() == []
     # чужой — молчим
     assert await env.cmd("/start", user_id=OTHER) == []
+    assert await env.cmd("/start " + "ZZZZZZZZ", user_id=OTHER) == []
     assert await env.cmd("/stats", user_id=OTHER) == []
 
 
 async def test_every_command_answers(env):
-    await env.cmd("/start")
+    await env.claim()
     await seed(env)
     expectations = [
         ("/help", "Я ищу лидов"), ("/stats", "Лидов за 24ч: 3"), ("/leads 5", "#3"), ("/digest", "Дайджест"),
@@ -175,7 +183,7 @@ async def test_every_command_answers(env):
 
 
 async def test_buttons_full_funnel(env):
-    await env.cmd("/start")
+    await env.claim()
     await seed(env, 1)
     calls = await env.tap("take:1")
     answers = [d for n, d in calls if n == "AnswerCallbackQuery"]
@@ -211,7 +219,7 @@ async def test_buttons_full_funnel(env):
 
 
 async def test_setup_group_creates_topics_and_routes_leads(env):
-    await env.cmd("/start")
+    await env.claim()
     group = -1001234567890
     texts = await env.cmd("/setup_group", chat_id=group)
     assert "Готово" in texts[-1]

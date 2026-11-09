@@ -3,6 +3,19 @@
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Бэкап базы перед обновлением (последние 5 копий)
+if [ -f data/leads.db ]; then
+    mkdir -p data/backups
+    BACKUP="data/backups/leads-$(date +%Y%m%d-%H%M%S).db"
+    if command -v sqlite3 >/dev/null 2>&1; then
+        sqlite3 data/leads.db ".backup '$BACKUP'" || cp data/leads.db "$BACKUP"
+    else
+        cp data/leads.db "$BACKUP"
+    fi
+    ls -1t data/backups/leads-*.db 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old"; done
+    echo "💾 Бэкап базы: $BACKUP"
+fi
+
 echo "⬇️  Забираю обновления…"
 if ! git pull --ff-only; then
     echo "❌ Не удалось обновить: в папке есть ваши правки кода. Отмените их (git stash) и запустите снова." >&2

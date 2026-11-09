@@ -1,11 +1,13 @@
 import json
+import logging
 import re
 from datetime import datetime, timezone
 
-from ..http import Fetcher
+from ..http import CaptchaError, Fetcher, NeedLoginError
 from ..models import Lead
 from .base import Source, strip_html
 
+log = logging.getLogger(__name__)
 BASE = "https://www.weblancer.net"
 CHUNK_RE = re.compile(r'self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)')
 REF_RE = re.compile(r"^\$[0-9a-f]+$")
@@ -60,8 +62,17 @@ class WeblancerSource(Source):
 
     async def poll(self) -> list[Lead]:
         leads: list[Lead] = []
+        error: Exception | None = None
         for url in self.urls:
-            r = await self.fetcher.get(url)
-            r.raise_for_status()
-            leads += parse_weblancer_html(r.text)
+            try:
+                r = await self.fetcher.get(url)
+                r.raise_for_status()
+                leads += parse_weblancer_html(r.text)
+            except (CaptchaError, NeedLoginError):
+                raise
+            except Exception as e:
+                log.warning("weblancer %s: %s", url, e)
+                error = e
+        if error and not leads:
+            raise error
         return leads

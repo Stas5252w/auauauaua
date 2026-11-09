@@ -1,12 +1,14 @@
 import html
 import json
+import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from ..http import Fetcher
+from ..http import CaptchaError, Fetcher, NeedLoginError
 from ..models import Lead
 from .base import Source, strip_html
 
+log = logging.getLogger(__name__)
 URL = "https://kwork.ru/projects"
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -61,15 +63,26 @@ class KworkSource(Source):
 
     async def poll(self) -> list[Lead]:
         leads: list[Lead] = []
+        error: Exception | None = None
         for cat in self.categories:
             for page in range(1, self.pages + 1):
                 params = {"page": page}
                 if cat:
                     params["c"] = cat
-                r = await self.fetcher.get(URL, params=params)
-                r.raise_for_status()
-                batch = parse_kwork_html(r.text)
+                try:
+                    r = await self.fetcher.get(URL, params=params)
+                    r.raise_for_status()
+                    batch = parse_kwork_html(r.text)
+                except (CaptchaError, NeedLoginError):
+                    raise
+                except Exception as e:
+                    # Упала страница — отдаём собранное, а не теряем всё
+                    log.warning("kwork cat=%r page=%d: %s", cat, page, e)
+                    error = e
+                    break
                 leads += batch
                 if len(batch) < 12:
                     break
+        if error and not leads:
+            raise error
         return leads

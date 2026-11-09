@@ -8,20 +8,29 @@ from .render import Brand, render_scene
 
 FPS = 30
 PAD = 0.3  # пауза после озвучки
+FFMPEG_TIMEOUT = 180.0  # с на одну сборку ролика
 
 
 def ffmpeg_available() -> bool:
     return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 
-async def _run(*args: str) -> tuple[int, str, str]:
+async def _run(*args: str, timeout: float | None = None) -> tuple[int, str, str]:
     p = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, err = await p.communicate()
+    try:
+        out, err = await asyncio.wait_for(p.communicate(), timeout)
+    except BaseException as e:  # таймаут и отмена: не оставляем зависший процесс
+        if p.returncode is None:
+            p.kill()
+            await p.wait()
+        if isinstance(e, asyncio.TimeoutError):
+            raise RuntimeError(f"{os.path.basename(args[0])} не уложился в {timeout:g} с и был остановлен") from None
+        raise
     return p.returncode, out.decode(errors="replace"), err.decode(errors="replace")
 
 
 async def _ffmpeg(*args: str) -> None:
-    code, _, err = await _run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args)
+    code, _, err = await _run("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args, timeout=FFMPEG_TIMEOUT)
     if code != 0:
         raise RuntimeError(f"ffmpeg завершился с кодом {code}: {err[-800:]}")
 
@@ -29,9 +38,9 @@ async def _ffmpeg(*args: str) -> None:
 async def probe_duration(path: str) -> float:
     try:
         code, out, _ = await _run("ffprobe", "-v", "error", "-show_entries", "format=duration",
-                                  "-of", "default=nw=1:nk=1", path)
+                                  "-of", "default=nw=1:nk=1", path, timeout=30)
         return float(out.strip()) if code == 0 else 0.0
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         return 0.0
 
 
