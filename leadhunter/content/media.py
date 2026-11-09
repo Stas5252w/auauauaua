@@ -31,3 +31,13 @@ class MediaStore:
         if not self.public_base:
             raise RuntimeError("Для публикации картинок и видео в Threads/Instagram нужен MINIAPP_URL (публичный HTTPS)")
         return self.url(self.save(data, ext))
+
+    def reserve(self, ext: str) -> str:
+        """Имя будущего файла без создания: если сборка упадёт, на диске не останется пустышки."""
+        return f"{secrets.token_urlsafe(12)}{ext if ext.startswith('.') else '.' + ext}"
+
+    def discard(self, name: str) -> None:
+        try:
+            os.remove(self.path(name))
+        except OSError:
+            pass

@@ -5,7 +5,13 @@ services:
     volumes:
       - ./data:/app/data
     ports:
-      - "8080:8080"   # Mini App; наружу — через HTTPS-прокси (Caddy / Cloudflare Tunnel)
+      # Только localhost: наружу Mini App отдаёт HTTPS-прокси (Caddy / Cloudflare Tunnel), а не прямой порт
+      - "127.0.0.1:8080:8080"
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # Для первой авторизации Telegram-аккаунта:
     # docker compose run --rm -it leadhunter python -m leadhunter.tg_login
