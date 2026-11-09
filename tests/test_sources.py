@@ -82,3 +82,67 @@ def test_parse_instagram_media():
     ]}
     (lead,) = parse_media(data, "нуженсайт")
     assert lead.source == "instagram" and lead.title == "#нуженсайт" and lead.external_id == "9"
+
+
+class _Resp:
+    def __init__(self, text="", status=200):
+        self.text, self.status_code = text, status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+async def test_kwork_poll_keeps_pages_before_failure():
+    from leadhunter.sources.kwork import KworkSource
+
+    page = '<script>window.stateData={"wantsListData":{"pagination":{"data":[%s]}}}</script>' % ",".join(
+        '{"id": %d, "name": "Нужен бот", "description": "текст"}' % i for i in range(1, 13))
+
+    class F:
+        n = 0
+
+        async def get(self, url, params=None):
+            self.n += 1
+            return _Resp(page) if self.n == 1 else _Resp(status=500)
+
+    src = KworkSource([""], 3, 600, None)
+    src.fetcher = F()
+    assert len(await src.poll()) == 12
+
+
+async def test_kwork_poll_raises_when_nothing_collected():
+    import pytest
+    from leadhunter.sources.kwork import KworkSource
+
+    class F:
+        async def get(self, url, params=None):
+            return _Resp(status=500)
+
+    src = KworkSource([""], 2, 600, None)
+    src.fetcher = F()
+    with pytest.raises(RuntimeError):
+        await src.poll()
+
+
+async def test_vk_poll_keeps_results_when_one_query_fails(monkeypatch):
+    import httpx
+    from types import SimpleNamespace
+    from leadhunter.sources import vk
+    from leadhunter.sources.vk import VKSource
+
+    class Phrases:
+        async def get(self):
+            return ["нужен сайт", "нужен бот"]
+
+    def handler(req):
+        if "бот" in req.url.params["q"]:
+            return httpx.Response(500)
+        return httpx.Response(200, json={"response": {"items": [{"owner_id": 1, "id": 2, "text": "Нужен сайт", "date": 1}]}})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(vk.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler)))
+    src = VKSource(SimpleNamespace(vk_token="t", vk_interval=60), Phrases())
+    before = src.since
+    assert len(await src.poll()) == 1
+    assert src.since == before  # окно не сдвинулось — упавший запрос повторится

@@ -10,25 +10,39 @@ from .factory import API_PLATFORMS, ContentFactory
 
 log = logging.getLogger(__name__)
 
+STUCK_MINUTES = 10  # столько publishing считается зависшим
+
 
 async def publish_due(factory: ContentFactory, publishers: list, notify) -> int:
     """Один проход: всё, чьё время пришло. notify(text) — сообщить владельцу о результате."""
     n = 0
+    # зависшие после рестарта: вернуть в план (вышедшие площадки пропустятся) или сообщить, что прервано
+    for item_id, requeued in await factory.store.requeue_stuck(STUCK_MINUTES, exclude=factory.active):
+        await notify(f"♻️ #{item_id}: публикация прервалась, повторю только недоставленные площадки." if requeued
+                     else f"⚠️ #{item_id}: публикация несколько раз прерывалась, автоповтор остановлен — проверьте площадки и нажмите «Опубликовать».")
+    e = html.escape
     for row in await factory.store.due():
+        name = f"#{row['id']} «{e(row['title'] or row['topic'])}»"
         if not publishers:
             await factory.store.schedule(row["id"], None)
-            await notify(f"⚠️ #{row['id']} «{html.escape(row['title'] or row['topic'])}» не вышел: площадки не настроены (/channels). Вернул в черновики.")
+            await notify(f"⚠️ {name} не вышел: площадки не настроены (/channels). Вернул в черновики.")
             continue
         out = await factory.publish(row, publishers)
+        if out.status == "busy":
+            continue  # уже публикуется или вышло: второй раз не постим
         n += 1
-        if out.results:
-            links = ", ".join(f"{API_PLATFORMS.get(r.platform, r.platform)}" + (f' <a href="{html.escape(r.url)}">↗</a>' if r.url else "")
-                              for r in out.results)
-            notes = "".join(f"\n⚠️ {html.escape(r.note)}" for r in out.results if getattr(r, "note", ""))
-            await notify(f"✅ #{row['id']} «{html.escape(row['title'] or row['topic'])}» опубликован: {links}{notes}")
-        else:
-            await factory.store.schedule(row["id"], None)
-            await notify(f"⚠️ #{row['id']} не опубликовался, вернул в черновики:\n" + "\n".join(html.escape(e) for e in out.errors))
+        fresh = await factory.store.get(row["id"])
+        done = json.loads(fresh["published"] or "[]") if fresh else []
+        links = ", ".join(API_PLATFORMS.get(d["platform"], d["platform"]) + (f' <a href="{e(d["url"])}">↗</a>' if d.get("url") else "")
+                          for d in done)
+        notes = "".join(f"\n⚠️ {e(r.note)}" for r in out.results if getattr(r, "note", ""))
+        if out.errors and done:
+            await notify(f"⚠️ {name} опубликован частично: {links}\nНе вышло:\n" + "\n".join(e(x) for x in out.errors)
+                         + f"{notes}\nПовтор — «Опубликовать» в карточке (уйдёт только на недостающие площадки).")
+        elif out.errors:
+            await notify(f"⚠️ {name} не опубликовался, вернул в черновики:\n" + "\n".join(e(x) for x in out.errors))
+        elif done:
+            await notify(f"✅ {name} опубликован: {links}{notes}")
     return n
 
 

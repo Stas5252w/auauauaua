@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
@@ -10,7 +11,7 @@ from ..db import Database
 from ..filters import parse_rule
 from ..models import Lead
 from .auth import validate_init_data
-from .landing import render_landing, render_thanks
+from .landing import render_landing, render_notice, render_thanks
 
 log = logging.getLogger(__name__)
 STATIC = os.path.join(os.path.dirname(__file__), "static")
@@ -21,8 +22,36 @@ def _row(r) -> dict:
     return dict(r) if r is not None else None
 
 
+def _client_ip(request: web.Request) -> str:
+    fwd = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    return fwd or request.remote or "?"
+
+
+class SubmitLimiter:
+    """Скользящие окна в памяти: заявки с одного IP и на одну страницу (защита лендинга от спама)."""
+
+    def __init__(self, per_ip: int = 5, ip_window: float = 600, per_slug: int = 30, slug_window: float = 3600):
+        self.rules = ((per_ip, ip_window, "ip"), (per_slug, slug_window, "slug"))
+        self.hits: dict[tuple[str, str], list[float]] = {}
+
+    def allow(self, ip: str, slug: str, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        if len(self.hits) > 10_000:  # не даём словарю расти бесконечно
+            self.hits = {k: v for k, v in self.hits.items() if v and now - v[-1] < 3600}
+        keys = {"ip": ("ip", ip), "slug": ("slug", slug)}
+        for limit, window, kind in self.rules:
+            hits = [t for t in self.hits.get(keys[kind], []) if now - t < window]
+            self.hits[keys[kind]] = hits
+            if len(hits) >= limit:
+                return False
+        for kind in keys.values():
+            self.hits[kind].append(now)
+        return True
+
+
 class MiniAppAPI:
     def __init__(self, db: Database, bot_token: str, guard, deps, sources, dev_user_id: int | None = None):
+        self.limiter = SubmitLimiter()
         self.db = db
         self.bot_token = bot_token
         self.guard = guard
@@ -32,7 +61,7 @@ class MiniAppAPI:
 
     # --- auth ---
     async def user(self, request: web.Request) -> dict:
-        init_data = request.headers.get("X-Init-Data") or request.query.get("initData", "")
+        init_data = request.headers.get("X-Init-Data", "")  # только заголовок: query попадает в логи и историю
         user = validate_init_data(init_data, self.bot_token) if init_data else None
         if user is None and self.dev_user_id and not init_data:
             user = {"id": self.dev_user_id, "first_name": "dev"}
@@ -393,15 +422,25 @@ class MiniAppAPI:
         from ..content.store import body_json
         return web.Response(text=render_landing(row, body_json(row), await self.factory.brand()), content_type="text/html")
 
+    async def _too_many(self, request, row):
+        headers = {"Retry-After": "600"}
+        if "application/json" in request.headers.get("Accept", ""):
+            return web.json_response({"error": "Слишком много заявок, попробуйте позже"}, status=429, headers=headers)
+        return web.Response(text=render_notice("Слишком много заявок", "Вы отправили слишком много заявок подряд. "
+                                               "Попробуйте через несколько минут.", await self.factory.brand()),
+                            status=429, content_type="text/html", headers=headers)
+
     async def landing_submit(self, request):
         slug = request.match_info["slug"]
         row = await self.factory.store.by_slug(slug)
-        if not row:
+        if not row or row["status"] == "rejected":
             raise web.HTTPNotFound()
+        if not self.limiter.allow(_client_ip(request), slug):
+            return await self._too_many(request, row)
         form = await request.post()
-        name = str(form.get("name", "")).strip()[:100]
-        contact = str(form.get("contact", "")).strip()[:100]
-        message = str(form.get("message", "")).strip()[:1000]
+        name = str(form.get("name", "")).strip()[:200]
+        contact = str(form.get("contact", "")).strip()[:200]
+        message = str(form.get("message", "")).strip()[:2000]
         if not contact or str(form.get("website", "")):  # website — скрытое поле-ловушка для ботов
             raise web.HTTPBadRequest(text="укажите контакт")
         n = await self.factory.store.add_landing_lead(slug, name, contact, message, None)

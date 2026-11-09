@@ -8,7 +8,7 @@ from .db import Database
 from .dedup import NearDuplicateIndex
 from .extract import extract_budget, extract_contacts
 from .filters import evaluate
-from .freshness import Freshness, check as freshness_check
+from .freshness import Freshness, check as freshness_check, is_board
 from .geo import geo_allows
 from .llm import LLMClassifier
 from .models import Lead
@@ -81,9 +81,10 @@ class Pipeline:
             return False
         if len(lead.full_text) < 15:
             return False
-        if not await self.db.mark_hash_seen(lead.full_text):
-            return False
+        # Спам-детект раньше дедупа по хэшу: одинаковая рассылка в разных чатах должна считаться как активность автора
         if await self._is_ignored(lead) or await self._is_spammer(lead):
+            return False
+        if not await self.db.mark_hash_seen(lead.full_text):
             return False
         found = lead.found_at if lead.found_at.tzinfo else lead.found_at.replace(tzinfo=timezone.utc)
         if datetime.now(timezone.utc) - found > self.max_age:
@@ -108,7 +109,7 @@ class Pipeline:
         info = await self._enrich(lead, rule)
         if info is None:
             return False
-        info.freshness = mark
+        info.freshness = mark or ("дата неизвестна" if lead.extra.get("undated") else "")
         if bonus and lead.preset_score is None:
             info.score = min(10, info.score + bonus)
         if info.score < await self.threshold():
@@ -138,9 +139,11 @@ class Pipeline:
             return Enriched(base, res, service=service, budget=budget, rule=rule or "",
                             draft=await self._template(service))
 
-        # ИИ смотрит всё, где есть хотя бы слово по теме или сработало правило
+        # ИИ смотрит всё, где есть слово по теме, сработало правило, либо есть явная фраза-намерение без темы
+        # («ищу исполнителя…» → словарный балл 0, но запрос может быть настоящим)
         if res.score < self.llm_min_score and not rule:
-            return None
+            if not (res.strong_intent and not res.topic and not res.negative):
+                return None
         bio = ""
         if self.author_bio and lead.source == "telegram" and lead.extra.get("sender_id"):
             try:
@@ -150,8 +153,8 @@ class Pipeline:
         profile = await self.db.get_setting("profile", self.default_profile) or self.default_profile
         good = [r["text"] for r in await self.db.leads_by_status("hot", 5)]
         bad = [r["text"] for r in await self.db.leads_by_status("spam", 5)]
-        text = lead.full_text + (f"\n\n[Об авторе: {bio}]" if bio else "")
-        verdict = await self.llm.classify(text, profile, good, bad)
+        verdict = await self.llm.classify(lead.full_text, profile, good, bad, source=lead.source,
+                                          is_board=is_board(lead), bio=bio)
         if verdict is None:
             return Enriched(base, res, service=service, budget=budget, rule=rule or "", author_bio=bio,
                             draft=await self._template(service))
