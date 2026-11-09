@@ -1,6 +1,6 @@
 /* LeadHunter Mini App — три экрана, одна шторка, минимум кнопок. */
 const tg = window.Telegram?.WebApp;
-const initData = tg?.initData || new URLSearchParams(location.search).get("initData") || "";
+const initData = tg?.initData || "";
 const inTelegram = Boolean(tg?.initData);
 if (tg) {
   tg.ready(); tg.expand();
@@ -192,7 +192,7 @@ async function openLead(id) {
   if (l.author_bio) facts.push(["О себе", esc(l.author_bio)]);
   if (l.chat_title) facts.push(["Чат", esc(l.chat_title)]);
   if (l.budget) facts.push(["Бюджет", esc(l.budget)]);
-  if (l.url) facts.push(["Источник", `<a href="${esc(l.url)}" data-ext>${esc(srcName(l.source))} ↗</a>`]);
+  if (l.url) facts.push(["Источник", /^https?:\/\//i.test(l.url) ? `<a href="${esc(l.url)}" data-ext>${esc(srcName(l.source))} ↗</a>` : esc(l.url)]);
   $("#sheet-content").innerHTML = `
     <h2>${esc(l.summary || l.title || l.text.slice(0, 90))}</h2>
     <div class="status-line">

@@ -57,6 +57,8 @@ def keyboard(row) -> InlineKeyboardMarkup:
     elif row["status"] == "scheduled":
         rows = [[InlineKeyboardButton(text="🚀 Сейчас", callback_data=f"cp:{i}"),
                  InlineKeyboardButton(text="❌ Снять с плана", callback_data=f"cu:{i}")], edit_row, tail]
+    elif row["status"] == "partial":
+        rows = [[InlineKeyboardButton(text="🔁 Повторить недостающие", callback_data=f"cp:{i}")], tail]
     else:
         rows = [tail]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -131,6 +133,9 @@ def format_card(row, tz: str = "Europe/Moscow") -> str:
     if row["published"]:
         for p in json.loads(row["published"]):
             meta.append(f"✅ {API_PLATFORMS.get(p['platform'], p['platform'])}" + (f': <a href="{e(p["url"])}">ссылка</a>' if p.get("url") else ""))
+    if row["publish_errors"] and row["status"] != "published":
+        for err in json.loads(row["publish_errors"]):
+            meta.append(f"❌ {e(err.get('label') or API_PLATFORMS.get(err.get('platform'), err.get('platform') or ''))}: {e(err.get('error', '')[:120])}")
     if row["slug"]:
         meta.append(f"🔗 страница: /lp/{row['slug']}")
     if meta:
@@ -529,14 +534,22 @@ def build_content_router(deps) -> Router:
         if not pubs:
             await cq.answer("Площадки не настроены: /channels", show_alert=True)
             return
+        if row["status"] in ("publishing", "published"):  # двойной клик / уже вышло
+            await cq.answer("Уже публикуется…" if row["status"] == "publishing" else "Уже опубликовано", show_alert=True)
+            return
         await cq.answer("Публикую…")
         out = await factory().publish(row, pubs)
+        if out.status == "busy":
+            await cq.message.reply(html.escape("⚠️ " + "\n⚠️ ".join(out.errors)))
+            return
         row = await factory().store.get(row["id"])
         await refresh(cq, row)
         msg = ("✅ Опубликовано: " + ", ".join(f"{API_PLATFORMS.get(r.platform, r.platform)} {r.url}".strip() for r in out.results)) if out.results else ""
         notes = [r.note for r in out.results if getattr(r, "note", "")]
         if out.errors or notes:
             msg += ("\n" if msg else "") + "⚠️ " + "\n⚠️ ".join(out.errors + notes)
+        if out.status == "partial":
+            msg += "\n🔁 Опубликовано частично — «Повторить недостающие» в карточке отправит только на площадки без успеха."
         await cq.message.reply(html.escape(msg) if msg else "Никуда не ушло", disable_web_page_preview=True)
 
     @router.callback_query(F.data.startswith("cs:"))
