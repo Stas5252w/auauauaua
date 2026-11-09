@@ -1,9 +1,12 @@
 """HTTP-сервер Mini App: статика + JSON API. Авторизация — подпись initData от Telegram."""
+import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
@@ -16,10 +19,55 @@ from .landing import render_landing, render_notice, render_thanks
 log = logging.getLogger(__name__)
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 STATUSES = ("new", "taken", "contacted", "replied", "deal", "lost", "spam", "hot")
+KINDS = ("post", "carousel", "reel", "toon", "aivideo", "magnet")
+VIDEO_KINDS = ("reel", "toon", "aivideo")  # сборка идёт минуты — в фоне, запрос не держим
+CHANNEL_PLATFORMS = ("telegram", "vk")  # остальные площадки подключаются ключами в «Подключениях»
+NO_AI_HINT = {
+    "carousel": "ИИ не подключён. Сценарием: Заголовок | слайд 1 | слайд 2",
+    "reel": "ИИ не подключён. Сценарием: фраза 1 | фраза 2 | фраза 3",
+    "toon": "ИИ не подключён. Сценарием: Название | Директор: реплика | Разработчик: реплика",
+}
 
 
 def _row(r) -> dict:
     return dict(r) if r is not None else None
+
+
+async def _body(request: web.Request) -> dict:
+    try:
+        body = await request.json()
+    except ValueError:
+        raise web.HTTPBadRequest(text="нужен JSON")
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(text="нужен JSON-объект")
+    return body
+
+
+def script_from_text(kind: str, topic: str) -> dict | None:
+    """Без ИИ материал собирается из текста через «|», как в боте: carousel/reel — слайды и сцены,
+    toon — «Название | Имя: реплика | …». Подходящего формата нет — None."""
+    parts = [p.strip() for p in topic.split("|") if p.strip()]
+    if len(parts) < 2:
+        return None
+    if kind == "carousel":
+        return {"title": parts[0], "slides": [{"title": parts[0], "text": ""}] + [{"title": "", "text": p} for p in parts[1:]],
+                "caption": parts[0], "hashtags": []}
+    if kind == "reel":
+        return {"title": parts[0], "scenes": [{"text": p, "voice": "", "duration": 3} for p in parts],
+                "caption": parts[0], "hashtags": []}
+    if kind == "toon":
+        chars, scenes = {}, []
+        for p in parts[1:]:
+            who, _, text = p.partition(":")
+            who, text = (who.strip() or "Герой"), (text.strip() or p.strip())
+            chars.setdefault(who, {"name": who, "color": ["#F2C14E", "#6FB9F0", "#8EEE98"][len(chars) % 3], "shape": "round"})
+            scenes.append({"bg": "office", "duration": 3.5,
+                           "characters": [{"id": c, "pos": "left" if i == 0 else "right" if i == 1 else "center",
+                                           "emotion": "happy" if c == who else "neutral", "action": "talk" if c == who else "idle"}
+                                          for i, c in enumerate(list(chars)[:3])],
+                           "line": {"speaker": who, "text": text}})
+        return {"title": parts[0], "style": "flat", "characters": chars, "scenes": scenes, "caption": parts[0], "hashtags": []}
+    return None
 
 
 def _client_ip(request: web.Request) -> str:
