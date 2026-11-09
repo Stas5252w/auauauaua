@@ -15,8 +15,10 @@ CREATE TABLE IF NOT EXISTS content_items (
     title TEXT, body TEXT,           -- body: текст поста либо JSON (слайды / сцены / пункты)
     caption TEXT, hashtags TEXT,
     image_prompt TEXT, media TEXT,   -- JSON: {"images": [пути], "video": путь, "cover": путь}
-    status TEXT NOT NULL DEFAULT 'draft',  -- draft | scheduled | published | rejected
-    scheduled_at TEXT, published_at TEXT, published TEXT,  -- published: JSON [{platform, url}]
+    status TEXT NOT NULL DEFAULT 'draft',  -- draft | scheduled | publishing | partial | published | rejected
+    scheduled_at TEXT, published_at TEXT, published TEXT,  -- published: JSON [{platform, url}], пополняется по мере выхода
+    publishing_at TEXT, publish_attempts INTEGER NOT NULL DEFAULT 0,  -- захват публикации и счётчик прерванных попыток
+    publish_errors TEXT,             -- JSON [{platform, label, error}]: площадки, где не вышло
     platforms TEXT,                  -- через запятую; пусто = все настроенные
     lead_id INTEGER, parent_id INTEGER, slug TEXT UNIQUE,
     msg_chat_id INTEGER, msg_id INTEGER,
@@ -38,7 +40,11 @@ CREATE TABLE IF NOT EXISTS landing_leads (
 
 KINDS = {"post": "✍️ Пост", "carousel": "🎠 Карусель", "reel": "🎬 Видео", "toon": "🎨 Мультик (код)", "aivideo": "🤖 ИИ-мультик",
          "magnet": "🧲 Лид-магнит", "idea": "💡 Идея"}
-STATUSES = {"draft": "черновик", "scheduled": "запланировано", "published": "опубликовано", "rejected": "отклонено"}
+STATUSES = {"draft": "черновик", "scheduled": "запланировано", "publishing": "публикуется", "partial": "частично опубликовано",
+            "published": "опубликовано", "rejected": "отклонено"}
+# Колонки, добавленные после первой версии: для существующих баз делаем ALTER TABLE
+_NEW_COLUMNS = {"publishing_at": "TEXT", "publish_attempts": "INTEGER NOT NULL DEFAULT 0", "publish_errors": "TEXT"}
+MAX_PUBLISH_ATTEMPTS = 3
 
 
 def _now() -> str:
@@ -55,6 +61,11 @@ class ContentStore:
 
     async def init(self) -> None:
         await self.conn.executescript(SCHEMA)
+        cur = await self.conn.execute("PRAGMA table_info(content_items)")
+        have = {r[1] for r in await cur.fetchall()}
+        for col, typ in _NEW_COLUMNS.items():
+            if col not in have:
+                await self.conn.execute(f"ALTER TABLE content_items ADD COLUMN {col} {typ}")
         await self.conn.commit()
 
     # --- материалы ---
@@ -85,7 +96,7 @@ class ContentStore:
             return
         if "hashtags" in fields and isinstance(fields["hashtags"], list):
             fields["hashtags"] = " ".join(fields["hashtags"])
-        for k in ("media", "published"):
+        for k in ("media", "published", "publish_errors"):
             if k in fields and not isinstance(fields[k], (str, type(None))):
                 fields[k] = json.dumps(fields[k], ensure_ascii=False)
         fields["updated_at"] = _now()
@@ -105,6 +116,49 @@ class ContentStore:
     async def mark_published(self, item_id: int, results: list[dict]) -> None:
         await self.update(item_id, status="published", published_at=_now(), published=results)
 
+    async def claim_publish(self, item_id: int) -> bool:
+        """Атомарно берёт материал в публикацию: второй параллельный вызов получит False."""
+        cur = await self.conn.execute(
+            "UPDATE content_items SET status = 'publishing', publishing_at = ?, publish_attempts = publish_attempts + 1,"
+            " updated_at = ? WHERE id = ? AND status IN ('draft', 'scheduled', 'partial')", (_now(), _now(), item_id))
+        await self.conn.commit()
+        return cur.rowcount == 1
+
+    async def touch_publishing(self, item_id: int, published: list[dict]) -> None:
+        """Результат площадки пишем сразу: после рестарта её не публикуем повторно."""
+        await self.update(item_id, published=published, publishing_at=_now())
+
+    async def finish_publish(self, item_id: int, published: list[dict], errors: list[dict], *, all_done: bool) -> str:
+        """published — все площадки вышли; partial — часть; draft — ни одна (можно повторить)."""
+        status = "published" if all_done else "partial" if published else "draft"
+        fields = dict(status=status, published=published, publish_errors=errors or None, publishing_at=None,
+                      publish_attempts=0)
+        if published:
+            fields["published_at"] = _now()
+        if status == "draft":
+            fields["scheduled_at"] = None
+        await self.update(item_id, **fields)
+        return status
+
+    async def requeue_stuck(self, minutes: int = 10, exclude=frozenset()) -> list[tuple[int, bool]]:
+        """Зависшие в publishing (рестарт посреди публикации) возвращаем в план: вышедшие площадки пропустятся.
+        После MAX_PUBLISH_ATTEMPTS прерванных попыток — без автоповтора (partial/draft). Возвращает [(id, requeued)]."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+        cur = await self.conn.execute(
+            "SELECT * FROM content_items WHERE status = 'publishing' AND (publishing_at IS NULL OR publishing_at < ?)", (cutoff,))
+        out = []
+        for row in await cur.fetchall():
+            if row["id"] in exclude:
+                continue
+            if row["publish_attempts"] < MAX_PUBLISH_ATTEMPTS:
+                await self.update(row["id"], status="scheduled", scheduled_at=_now(), publishing_at=None)
+                out.append((row["id"], True))
+            else:
+                err = [{"platform": "", "label": "", "error": "публикация прервана несколько раз подряд"}]
+                await self.finish_publish(row["id"], json.loads(row["published"] or "[]"), err, all_done=False)
+                out.append((row["id"], False))
+        return out
+
     async def due(self) -> list[aiosqlite.Row]:
         cur = await self.conn.execute(
             "SELECT * FROM content_items WHERE status = 'scheduled' AND scheduled_at <= ? ORDER BY scheduled_at", (_now(),))
@@ -112,7 +166,7 @@ class ContentStore:
 
     async def queue(self, limit: int = 30) -> list[aiosqlite.Row]:
         cur = await self.conn.execute(
-            "SELECT * FROM content_items WHERE status IN ('draft', 'scheduled') AND kind != 'idea'"
+            "SELECT * FROM content_items WHERE status IN ('draft', 'scheduled', 'publishing', 'partial') AND kind != 'idea'"
             " ORDER BY status DESC, scheduled_at, id DESC LIMIT ?", (limit,))
         return list(await cur.fetchall())
 
