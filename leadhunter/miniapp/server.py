@@ -1,9 +1,12 @@
 """HTTP-сервер Mini App: статика + JSON API. Авторизация — подпись initData от Telegram."""
+import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
@@ -16,10 +19,55 @@ from .landing import render_landing, render_notice, render_thanks
 log = logging.getLogger(__name__)
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 STATUSES = ("new", "taken", "contacted", "replied", "deal", "lost", "spam", "hot")
+KINDS = ("post", "carousel", "reel", "toon", "aivideo", "magnet")
+VIDEO_KINDS = ("reel", "toon", "aivideo")  # сборка идёт минуты — в фоне, запрос не держим
+CHANNEL_PLATFORMS = ("telegram", "vk")  # остальные площадки подключаются ключами в «Подключениях»
+NO_AI_HINT = {
+    "carousel": "ИИ не подключён. Сценарием: Заголовок | слайд 1 | слайд 2",
+    "reel": "ИИ не подключён. Сценарием: фраза 1 | фраза 2 | фраза 3",
+    "toon": "ИИ не подключён. Сценарием: Название | Директор: реплика | Разработчик: реплика",
+}
 
 
 def _row(r) -> dict:
     return dict(r) if r is not None else None
+
+
+async def _body(request: web.Request) -> dict:
+    try:
+        body = await request.json()
+    except ValueError:
+        raise web.HTTPBadRequest(text="нужен JSON")
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(text="нужен JSON-объект")
+    return body
+
+
+def script_from_text(kind: str, topic: str) -> dict | None:
+    """Без ИИ материал собирается из текста через «|», как в боте: carousel/reel — слайды и сцены,
+    toon — «Название | Имя: реплика | …». Подходящего формата нет — None."""
+    parts = [p.strip() for p in topic.split("|") if p.strip()]
+    if len(parts) < 2:
+        return None
+    if kind == "carousel":
+        return {"title": parts[0], "slides": [{"title": parts[0], "text": ""}] + [{"title": "", "text": p} for p in parts[1:]],
+                "caption": parts[0], "hashtags": []}
+    if kind == "reel":
+        return {"title": parts[0], "scenes": [{"text": p, "voice": "", "duration": 3} for p in parts],
+                "caption": parts[0], "hashtags": []}
+    if kind == "toon":
+        chars, scenes = {}, []
+        for p in parts[1:]:
+            who, _, text = p.partition(":")
+            who, text = (who.strip() or "Герой"), (text.strip() or p.strip())
+            chars.setdefault(who, {"name": who, "color": ["#F2C14E", "#6FB9F0", "#8EEE98"][len(chars) % 3], "shape": "round"})
+            scenes.append({"bg": "office", "duration": 3.5,
+                           "characters": [{"id": c, "pos": "left" if i == 0 else "right" if i == 1 else "center",
+                                           "emotion": "happy" if c == who else "neutral", "action": "talk" if c == who else "idle"}
+                                          for i, c in enumerate(list(chars)[:3])],
+                           "line": {"speaker": who, "text": text}})
+        return {"title": parts[0], "style": "flat", "characters": chars, "scenes": scenes, "caption": parts[0], "hashtags": []}
+    return None
 
 
 def _client_ip(request: web.Request) -> str:
@@ -58,6 +106,31 @@ class MiniAppAPI:
         self.deps = deps
         self.sources = sources
         self.dev_user_id = dev_user_id
+        self._rendering: set[int] = set()  # материалы, которые собираются в фоне прямо сейчас
+        self._bg: set[asyncio.Task] = set()
+
+    async def close(self, app=None) -> None:
+        for t in list(self._bg):
+            t.cancel()
+        await asyncio.gather(*self._bg, return_exceptions=True)
+
+    @property
+    def bot(self):
+        return getattr(self.guard, "bot", None)
+
+    def _need_bot(self):
+        if self.bot is None:
+            raise web.HTTPServiceUnavailable(text="бот недоступен")
+        return self.bot
+
+    async def _paused(self) -> bool:
+        return (await self.db.get_setting("paused")) == "1"
+
+    def _capabilities(self) -> dict:
+        """Что доступно в «Контенте»: ИИ-тексты и ИИ-видео (нужны ключи). Мультик «кодом» работает и без ИИ — по сценарию."""
+        f = self.deps.extra.get("factory")
+        ai = bool(f and f.gen.available)
+        return {"content": bool(f), "ai": ai, "aivideo": bool(ai and f.video_ai and f.video_ai.video_enabled)}
 
     # --- auth ---
     async def user(self, request: web.Request) -> dict:
@@ -80,7 +153,46 @@ class MiniAppAPI:
     # --- handlers ---
     async def me(self, request):
         user = await self.user(request)
-        return web.json_response({"user": user, "sources": [s.status_line() for s in self.sources]})
+        return web.json_response({"user": user, "sources": [s.status_line() for s in self.sources],
+                                  "capabilities": self._capabilities(), "paused": await self._paused()})
+
+    async def pause_set(self, request):
+        """Пауза уведомлений — то же хранилище, что у /pause и /resume: лиды копятся в базе, в чат не идут."""
+        user = await self.user(request)
+        paused = (await _body(request)).get("paused")
+        if not isinstance(paused, bool):
+            raise web.HTTPBadRequest(text="нужно paused: true или false")
+        await self.db.set_setting("paused", "1" if paused else "0")
+        log.info("paused=%s by %s", paused, user["id"])
+        return web.json_response({"paused": paused})
+
+    async def export_csv(self, request):
+        """Как /export: только владелец, файл присылает бот в личку (в WebView скачивание ненадёжно)."""
+        user = await self.user(request)
+        if not user.get("is_owner"):
+            raise web.HTTPForbidden(text="только владелец")
+        bot = self._need_bot()
+        from aiogram.types import BufferedInputFile
+        data = await self.db.export_csv()
+        try:
+            await bot.send_document(int(user["id"]), BufferedInputFile(data, filename="leads.csv"), caption="Последние 1000 лидов")
+        except Exception as e:
+            log.warning("csv не отправился пользователю %s: %s", user["id"], e)
+            raise web.HTTPBadGateway(text=f"Не удалось отправить файл: {getattr(e, 'message', None) or e}"[:300])
+        log.info("csv-экспорт для %s", user["id"])
+        return web.json_response({"ok": True})
+
+    async def digest_send(self, request):
+        """Как /digest: сводка за сутки приходит от бота в личку запросившему."""
+        user = await self.user(request)
+        bot = self._need_bot()
+        from ..bot.handlers import build_digest
+        try:
+            await bot.send_message(int(user["id"]), await build_digest(self.db), disable_web_page_preview=True)
+        except Exception as e:
+            log.warning("дайджест не отправился пользователю %s: %s", user["id"], e)
+            raise web.HTTPBadGateway(text=f"Не удалось отправить дайджест: {getattr(e, 'message', None) or e}"[:300])
+        return web.json_response({"ok": True})
 
     async def leads(self, request):
         await self.user(request)
@@ -191,7 +303,7 @@ class MiniAppAPI:
             "threshold": await self.db.get_setting("threshold", str(self.deps.extra.get("threshold", 5))),
             "profile": await self.db.get_setting("profile") or self.deps.default_profile,
             "geo": await self.db.get_setting("geo", ""),
-            "paused": (await self.db.get_setting("paused")) == "1",
+            "paused": await self._paused(),
             "phrases": await self.deps.phrases.get(),
             "rules": [dict(r) for r in await self.db.rules()],
             "keywords": {"topic": kw.topic, "intent": kw.intent, "negative": kw.negative},

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -42,15 +43,27 @@ def spawn(coro, name: str) -> asyncio.Task:
     return watch(asyncio.create_task(coro, name=name))
 
 
-async def run() -> None:
-    s = Settings()
-    db = Database(s.db_path)
-    await db.connect()
-    applied = await load_overrides(db, s)  # ключи, введённые через /setup или кабинет
-    if applied:
-        log.info("подключения из базы: %s", ", ".join(applied))
+@dataclass
+class App:
+    """Всё, что собирает build_app: боевой main и сквозная проверка (scripts/live_check.py) строят бота одинаково."""
+    settings: Settings
+    db: Database
+    bot: Bot
+    dp: Dispatcher
+    deps: BotDeps
+    pipeline: Pipeline
+    notifier: MultiNotifier
+    tg_notifier: TelegramNotifier
+    guard: Guard
+    phrases: PhraseProvider
+    sources: list
+    llm: object
+    factory: object
+    tunnel: object = None
 
-    bot = Bot(s.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
+
+async def build_app(s: Settings, bot: Bot, db: Database) -> App:
+    """Уведомления, пайплайн, источники, роутеры, контент-фабрика и подключения; фоновые задачи и polling — в run()."""
     tg_notifier = TelegramNotifier(bot, db, s.owner_ids, outreach_enabled=s.tg_outreach_limit > 0,
                                    hot_score=s.hot_score, deliver_dm=s.deliver_dm)
     notifier = MultiNotifier(tg_notifier, WebhookNotifier(s.webhook_url) if s.webhook_url else None)
@@ -102,13 +115,30 @@ async def run() -> None:
 
     deps.extra["integrations"] = Integrations(db, s, on_change)
     deps.extra["settings"] = s
+    return App(s, db, bot, dp, deps, pipeline, notifier, tg_notifier, guard, phrases, sources, llm, factory, tunnel)
 
+
+async def register_commands(bot: Bot) -> None:
     try:
         await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in BOT_COMMANDS])
     except Exception as e:
         log.warning("не удалось зарегистрировать команды бота: %s", e)
 
-    tasks = [spawn(src.run(pipeline.handle), src.name) for src in sources]
+
+async def run() -> None:
+    s = Settings()
+    db = Database(s.db_path)
+    await db.connect()
+    applied = await load_overrides(db, s)  # ключи, введённые через /setup или кабинет
+    if applied:
+        log.info("подключения из базы: %s", ", ".join(applied))
+
+    bot = Bot(s.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
+    app = await build_app(s, bot, db)
+    await register_commands(bot)
+    dp, deps, pipeline, tg_notifier, factory, tunnel = app.dp, app.deps, app.pipeline, app.tg_notifier, app.factory, app.tunnel
+
+    tasks = [spawn(src.run(pipeline.handle), src.name) for src in app.sources]
     tasks.append(spawn(sla_loop(db, tg_notifier, s.sla_minutes, s.sla_min_score), "sla"))
     tasks.append(spawn(followup_loop(db, tg_notifier), "followup"))
     tasks.append(spawn(content_loop(factory, deps.extra["publishers"], deps.extra["content_notify"]), "content"))
