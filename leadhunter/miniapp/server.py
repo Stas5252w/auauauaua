@@ -32,7 +32,7 @@ class MiniAppAPI:
 
     # --- auth ---
     async def user(self, request: web.Request) -> dict:
-        init_data = request.headers.get("X-Init-Data") or request.query.get("initData", "")
+        init_data = request.headers.get("X-Init-Data", "")  # только заголовок: query попадает в логи и историю
         user = validate_init_data(init_data, self.bot_token) if init_data else None
         if user is None and self.dev_user_id and not init_data:
             user = {"id": self.dev_user_id, "first_name": "dev"}

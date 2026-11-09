@@ -62,3 +62,15 @@ async def digest_loop(db: Database, notifier: TelegramNotifier, hour: int, tz_na
                 await notifier.send(await build_funnel(db, 7, "source"), topic="reports")
         except Exception:
             log.exception("дайджест не отправился")
+
+
+async def purge_loop(db: Database, days: int) -> None:
+    """Раз в сутки чистит старые записи дедупа (первый проход — сразу при старте)."""
+    while True:
+        try:
+            n = await db.purge_old(days)
+            if n:
+                log.info("purge: удалено %d старых записей дедупа", n)
+        except Exception:
+            log.exception("purge loop")
+        await asyncio.sleep(24 * 3600)
